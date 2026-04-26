@@ -3,13 +3,16 @@ import json
 import os
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 app = FastAPI()
 
 RUTUBE_DOMAINS = ("rutube.ru", "www.rutube.ru")
 VALID_TOKENS = set(t.strip() for t in os.getenv("API_TOKENS", "").split(",") if t.strip())
+
+MAX_DURATION = 4 * 60 * 60  # 4 часа
+MAX_START = 24 * 60 * 60    # 24 часа
 
 
 def validate_rutube_url(url: str) -> bool:
@@ -35,7 +38,13 @@ async def get_stream_url(video_url: str) -> dict:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise HTTPException(504, "yt-dlp timeout")
+
     if proc.returncode != 0:
         raise HTTPException(502, f"yt-dlp: {stderr.decode()[-500:]}")
 
@@ -59,16 +68,27 @@ async def get_stream_url(video_url: str) -> dict:
     }
 
 
-def build_ffmpeg_cmd(video_url: str, audio_url: str | None, headers: dict) -> list[str]:
+def build_ffmpeg_cmd(
+    video_url: str,
+    audio_url: str | None,
+    headers: dict,
+    start: float | None,
+    duration: float | None,
+) -> list[str]:
     ua = headers.get("User-Agent", "Mozilla/5.0")
-    cmd = [
-        "ffmpeg",
-        "-loglevel", "warning",
+    cmd = ["ffmpeg", "-loglevel", "warning"]
+
+    if start is not None:
+        cmd += ["-ss", str(start)]
+    cmd += [
         "-user_agent", ua,
         "-referer", "https://rutube.ru/",
         "-i", video_url,
     ]
+
     if audio_url:
+        if start is not None:
+            cmd += ["-ss", str(start)]
         cmd += [
             "-user_agent", ua,
             "-referer", "https://rutube.ru/",
@@ -78,9 +98,14 @@ def build_ffmpeg_cmd(video_url: str, audio_url: str | None, headers: dict) -> li
     else:
         cmd += ["-map", "0:v:0", "-map", "0:a:0"]
 
+    if duration is not None:
+        cmd += ["-t", str(duration)]
+
     cmd += [
         "-c:v", "copy",
         "-c:a", "aac",
+        "-avoid_negative_ts", "make_zero",
+        "-fflags", "+genpts",
         "-movflags", "frag_keyframe+empty_moov+default_base_moof",
         "-f", "mp4",
         "pipe:1",
@@ -88,9 +113,16 @@ def build_ffmpeg_cmd(video_url: str, audio_url: str | None, headers: dict) -> li
     return cmd
 
 
-async def stream_video(video_url: str, request: Request):
+async def stream_video(
+    video_url: str,
+    request: Request,
+    start: float | None,
+    duration: float | None,
+):
     streams = await get_stream_url(video_url)
-    cmd = build_ffmpeg_cmd(streams["video"], streams["audio"], streams["headers"])
+    cmd = build_ffmpeg_cmd(
+        streams["video"], streams["audio"], streams["headers"], start, duration
+    )
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -138,12 +170,18 @@ async def stream_video(video_url: str, request: Request):
 
 
 @app.get("/")
-async def stream(v: str, auth: str, request: Request):
+async def stream(
+    request: Request,
+    v: str,
+    auth: str,
+    t: float | None = Query(None, ge=0, le=MAX_START),
+    duration: float | None = Query(None, gt=0, le=MAX_DURATION),
+):
     if not validate_rutube_url(v):
         raise HTTPException(status_code=400, detail="Invalid Rutube URL")
     if not verify_token(auth):
         raise HTTPException(status_code=401, detail="Invalid or missing token")
-    return await stream_video(v, request)
+    return await stream_video(v, request, t, duration)
 
 
 @app.get("/health")
