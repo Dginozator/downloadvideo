@@ -9,32 +9,54 @@ from fastapi.responses import StreamingResponse
 app = FastAPI()
 
 RUTUBE_DOMAINS = ("rutube.ru", "www.rutube.ru")
+YOUTUBE_DOMAINS = (
+    "youtube.com", "www.youtube.com", "m.youtube.com",
+    "youtu.be", "music.youtube.com",
+)
+
 VALID_TOKENS = set(t.strip() for t in os.getenv("API_TOKENS", "").split(",") if t.strip())
+YT_COOKIES = os.getenv("YT_COOKIES_FILE", "").strip()
 
-MAX_DURATION = 4 * 60 * 60  # 4 часа
-MAX_START = 24 * 60 * 60    # 24 часа
+MAX_DURATION = 4 * 60 * 60
+MAX_START = 24 * 60 * 60
 
 
-def validate_rutube_url(url: str) -> bool:
+def detect_source(url: str) -> str | None:
     try:
         parsed = urlparse(url)
-        return parsed.netloc in RUTUBE_DOMAINS and parsed.scheme in ("http", "https")
+        if parsed.scheme not in ("http", "https"):
+            return None
+        if parsed.netloc in RUTUBE_DOMAINS:
+            return "rutube"
+        if parsed.netloc in YOUTUBE_DOMAINS:
+            return "youtube"
+        return None
     except Exception:
-        return False
+        return None
 
 
 def verify_token(token: str) -> bool:
     return token in VALID_TOKENS if VALID_TOKENS else False
 
 
-async def get_stream_url(video_url: str) -> dict:
-    proc = await asyncio.create_subprocess_exec(
+def referer_for(source: str) -> str:
+    return "https://www.youtube.com/" if source == "youtube" else "https://rutube.ru/"
+
+
+async def get_stream_url(video_url: str, source: str) -> dict:
+    args = [
         "yt-dlp",
         "-f", "bv*+ba/b",
         "-j",
         "--no-playlist",
         "--no-warnings",
-        video_url,
+    ]
+    if source == "youtube" and YT_COOKIES:
+        args += ["--cookies", YT_COOKIES]
+    args.append(video_url)
+
+    proc = await asyncio.create_subprocess_exec(
+        *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -72,6 +94,7 @@ def build_ffmpeg_cmd(
     video_url: str,
     audio_url: str | None,
     headers: dict,
+    referer: str,
     start: float | None,
     duration: float | None,
 ) -> list[str]:
@@ -82,7 +105,7 @@ def build_ffmpeg_cmd(
         cmd += ["-ss", str(start)]
     cmd += [
         "-user_agent", ua,
-        "-referer", "https://rutube.ru/",
+        "-referer", referer,
         "-i", video_url,
     ]
 
@@ -91,7 +114,7 @@ def build_ffmpeg_cmd(
             cmd += ["-ss", str(start)]
         cmd += [
             "-user_agent", ua,
-            "-referer", "https://rutube.ru/",
+            "-referer", referer,
             "-i", audio_url,
             "-map", "0:v", "-map", "1:a",
         ]
@@ -115,13 +138,19 @@ def build_ffmpeg_cmd(
 
 async def stream_video(
     video_url: str,
+    source: str,
     request: Request,
     start: float | None,
     duration: float | None,
 ):
-    streams = await get_stream_url(video_url)
+    streams = await get_stream_url(video_url, source)
     cmd = build_ffmpeg_cmd(
-        streams["video"], streams["audio"], streams["headers"], start, duration
+        streams["video"],
+        streams["audio"],
+        streams["headers"],
+        referer_for(source),
+        start,
+        duration,
     )
 
     proc = await asyncio.create_subprocess_exec(
@@ -177,11 +206,12 @@ async def stream(
     t: float | None = Query(None, ge=0, le=MAX_START),
     duration: float | None = Query(None, gt=0, le=MAX_DURATION),
 ):
-    if not validate_rutube_url(v):
-        raise HTTPException(status_code=400, detail="Invalid Rutube URL")
+    source = detect_source(v)
+    if source is None:
+        raise HTTPException(status_code=400, detail="Unsupported URL (rutube/youtube only)")
     if not verify_token(auth):
         raise HTTPException(status_code=401, detail="Invalid or missing token")
-    return await stream_video(v, request, t, duration)
+    return await stream_video(v, source, request, t, duration)
 
 
 @app.get("/health")
