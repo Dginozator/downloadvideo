@@ -2,16 +2,17 @@ version: '3.8'
 
 services:
   rutube-streamer:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
     environment:
-      - API_TOKENS=${API_TOKENS}  # comma-separated: token1,token2
-      - YTDL_UPDATE_ON_START=true
+      - API_TOKENS=${API_TOKENS}
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G
           cpus: '2'
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
