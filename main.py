@@ -120,17 +120,15 @@ async def stream_pipeline(video_url: str, request: Request):
             ff_proc.kill()
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/")
-async def stream(video: str, auth: str, request: Request):
-    if not validate_rutube_url(video):
+async def stream(v: str, auth: str, request: Request):
+    if not validate_rutube_url(v):
         raise HTTPException(status_code=400, detail="Invalid Rutube URL")
     
     if not verify_token(auth):
         raise HTTPException(status_code=401, detail="Invalid or missing token")
 
-    return await stream_pipeline(video, request)
-
+    return await stream_pipeline(v, request)
 
 @app.get("/health")
 async def health():
