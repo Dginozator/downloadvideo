@@ -45,7 +45,6 @@ def build_ffmpeg_command() -> list[str]:
         "pipe:1",
     ]
 
-
 async def stream_pipeline(video_url: str, request: Request):
     yt_proc = None
     ff_proc = None
@@ -98,6 +97,21 @@ async def stream_pipeline(video_url: str, request: Request):
                 if yt_proc:
                     yt_proc.wait(timeout=5)
 
+        # Читаем stderr асинхронно для логирования
+        import asyncio
+
+        async def read_stderr(proc, label):
+            while True:
+                line = await asyncio.get_event_loop().run_in_executor(
+                    None, proc.stderr.readline
+                )
+                if not line:
+                    break
+                print(f"[{label}] {line.decode().strip()}", flush=True)
+
+        asyncio.create_task(read_stderr(yt_proc, "yt-dlp"))
+        asyncio.create_task(read_stderr(ff_proc, "ffmpeg"))
+
         return StreamingResponse(
             generate(),
             media_type="video/mp4",
@@ -112,7 +126,13 @@ async def stream_pipeline(video_url: str, request: Request):
             yt_proc.kill()
         if ff_proc:
             ff_proc.kill()
-        raise HTTPException(status_code=502, detail=f"Pipeline error: {e}")
+        # Читаем оставшийся stderr для детализации
+        err_yt = yt_proc.stderr.read().decode() if yt_proc and yt_proc.stderr else ""
+        err_ff = ff_proc.stderr.read().decode() if ff_proc and ff_proc.stderr else ""
+        raise HTTPException(
+            status_code=502,
+            detail=f"Pipeline error: {e}\nyt-dlp: {err_yt}\nffmpeg: {err_ff}"
+        )
     except Exception as e:
         if yt_proc:
             yt_proc.kill()
