@@ -79,7 +79,8 @@ def build_ffmpeg_cmd(video_url: str, audio_url: str | None, headers: dict) -> li
         cmd += ["-map", "0:v:0", "-map", "0:a:0"]
 
     cmd += [
-        "-c", "copy",
+        "-c:v", "copy",
+        "-c:a", "aac",
         "-movflags", "frag_keyframe+empty_moov+default_base_moof",
         "-f", "mp4",
         "pipe:1",
