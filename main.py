@@ -1,7 +1,7 @@
+import asyncio
+import json
 import os
-import signal
-import subprocess
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -24,131 +24,105 @@ def verify_token(token: str) -> bool:
     return token in VALID_TOKENS if VALID_TOKENS else False
 
 
-def build_command(video_url: str) -> list[str]:
-    return [
+async def get_stream_url(video_url: str) -> dict:
+    proc = await asyncio.create_subprocess_exec(
         "yt-dlp",
-        "-f", "bestvideo+bestaudio/best",
+        "-f", "bv*+ba/b",
+        "-j",
         "--no-playlist",
         "--no-warnings",
-        "-o", "-",
         video_url,
-    ]
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise HTTPException(502, f"yt-dlp: {stderr.decode()[-500:]}")
+
+    info = json.loads(stdout)
+    if "requested_formats" in info:
+        fmts = info["requested_formats"]
+        video = next((f for f in fmts if f.get("vcodec") != "none"), None)
+        audio = next(
+            (f for f in fmts if f.get("acodec") != "none" and f.get("vcodec") == "none"),
+            None,
+        )
+        return {
+            "video": video["url"],
+            "audio": audio["url"] if audio else None,
+            "headers": video.get("http_headers", {}),
+        }
+    return {
+        "video": info["url"],
+        "audio": None,
+        "headers": info.get("http_headers", {}),
+    }
 
 
-def build_ffmpeg_command() -> list[str]:
-    return [
-        "ffmpeg",
-        "-i", "pipe:0",
+def build_ffmpeg_cmd(video_url: str, audio_url: str | None, headers: dict) -> list[str]:
+    header_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+    cmd = ["ffmpeg", "-loglevel", "warning"]
+    if header_str:
+        cmd += ["-headers", header_str]
+    cmd += ["-i", video_url]
+    if audio_url:
+        if header_str:
+            cmd += ["-headers", header_str]
+        cmd += ["-i", audio_url, "-map", "0:v", "-map", "1:a"]
+    cmd += [
         "-c", "copy",
-        "-movflags", "faststart",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
         "-f", "mp4",
         "pipe:1",
     ]
+    return cmd
 
-async def stream_pipeline(video_url: str, request: Request):
-    yt_proc = None
-    ff_proc = None
 
-    try:
-        yt_proc = subprocess.Popen(
-            build_command(video_url),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            bufsize=65536,
-        )
+async def stream_video(video_url: str, request: Request):
+    streams = await get_stream_url(video_url)
+    cmd = build_ffmpeg_cmd(streams["video"], streams["audio"], streams["headers"])
 
-        ff_proc = subprocess.Popen(
-            build_ffmpeg_command(),
-            stdin=yt_proc.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-            bufsize=65536,
-        )
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
 
-        yt_proc.stdout.close()
-
-        def kill_tree(proc):
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-
-        async def generate():
-            try:
-                while True:
-                    if await request.is_disconnected():
-                        kill_tree(ff_proc)
-                        kill_tree(yt_proc)
-                        break
-
-                    chunk = ff_proc.stdout.read(65536)
-                    if not chunk:
-                        break
-                    yield chunk
-
-            finally:
-                kill_tree(ff_proc)
-                kill_tree(yt_proc)
-                if ff_proc:
-                    ff_proc.wait(timeout=5)
-                if yt_proc:
-                    yt_proc.wait(timeout=5)
-
-        # Читаем stderr асинхронно для логирования
-        import asyncio
-
-        async def read_stderr(proc, label):
+    async def generate():
+        try:
             while True:
-                line = await asyncio.get_event_loop().run_in_executor(
-                    None, proc.stderr.readline
-                )
-                if not line:
+                if await request.is_disconnected():
                     break
-                print(f"[{label}] {line.decode().strip()}", flush=True)
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
 
-        asyncio.create_task(read_stderr(yt_proc, "yt-dlp"))
-        asyncio.create_task(read_stderr(ff_proc, "ffmpeg"))
+    return StreamingResponse(
+        generate(),
+        media_type="video/mp4",
+        headers={
+            "Accept-Ranges": "none",
+            "Cache-Control": "no-cache",
+        },
+    )
 
-        return StreamingResponse(
-            generate(),
-            media_type="video/mp4",
-            headers={
-                "Accept-Ranges": "none",
-                "Cache-Control": "no-cache",
-            },
-        )
-
-    except subprocess.SubprocessError as e:
-        if yt_proc:
-            yt_proc.kill()
-        if ff_proc:
-            ff_proc.kill()
-        # Читаем оставшийся stderr для детализации
-        err_yt = yt_proc.stderr.read().decode() if yt_proc and yt_proc.stderr else ""
-        err_ff = ff_proc.stderr.read().decode() if ff_proc and ff_proc.stderr else ""
-        raise HTTPException(
-            status_code=502,
-            detail=f"Pipeline error: {e}\nyt-dlp: {err_yt}\nffmpeg: {err_ff}"
-        )
-    except Exception as e:
-        if yt_proc:
-            yt_proc.kill()
-        if ff_proc:
-            ff_proc.kill()
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 async def stream(v: str, auth: str, request: Request):
     if not validate_rutube_url(v):
         raise HTTPException(status_code=400, detail="Invalid Rutube URL")
-    
     if not verify_token(auth):
         raise HTTPException(status_code=401, detail="Invalid or missing token")
+    return await stream_video(v, request)
 
-    return await stream_pipeline(v, request)
 
 @app.get("/health")
 async def health():
