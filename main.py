@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -41,6 +42,27 @@ def verify_token(token: str) -> bool:
 
 def referer_for(source: str) -> str:
     return "https://www.youtube.com/" if source == "youtube" else "https://rutube.ru/"
+
+
+def safe_filename(video_url: str, start: float | None, duration: float | None) -> str:
+    parsed = urlparse(video_url)
+    vid = ""
+    if parsed.netloc in YOUTUBE_DOMAINS:
+        if parsed.netloc == "youtu.be":
+            vid = parsed.path.strip("/").split("/")[0]
+        else:
+            from urllib.parse import parse_qs
+            vid = (parse_qs(parsed.query).get("v") or [""])[0]
+    if not vid:
+        path = parsed.path.rstrip("/")
+        vid = path.split("/")[-1] if path else "video"
+    vid = re.sub(r"[^A-Za-z0-9_-]", "_", vid)[:64] or "video"
+    suffix = ""
+    if start is not None:
+        suffix += f"_t{int(start)}"
+    if duration is not None:
+        suffix += f"_d{int(duration)}"
+    return f"{vid}{suffix}.mp4"
 
 
 async def get_stream_url(video_url: str, source: str) -> dict:
@@ -188,12 +210,15 @@ async def stream_video(
                     await proc.wait()
             await stderr_task
 
+    filename = safe_filename(video_url, start, duration)
     return StreamingResponse(
         generate(),
         media_type="video/mp4",
         headers={
             "Accept-Ranges": "none",
             "Cache-Control": "no-cache",
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
