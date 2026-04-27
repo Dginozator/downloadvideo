@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -44,25 +44,30 @@ def referer_for(source: str) -> str:
     return "https://www.youtube.com/" if source == "youtube" else "https://rutube.ru/"
 
 
-def safe_filename(video_url: str, start: float | None, duration: float | None) -> str:
-    parsed = urlparse(video_url)
-    vid = ""
-    if parsed.netloc in YOUTUBE_DOMAINS:
-        if parsed.netloc == "youtu.be":
-            vid = parsed.path.strip("/").split("/")[0]
-        else:
-            from urllib.parse import parse_qs
-            vid = (parse_qs(parsed.query).get("v") or [""])[0]
-    if not vid:
-        path = parsed.path.rstrip("/")
-        vid = path.split("/")[-1] if path else "video"
-    vid = re.sub(r"[^A-Za-z0-9_-]", "_", vid)[:64] or "video"
+def sanitize_title(title: str) -> str:
+    t = re.sub(r'[\x00-\x1f\x7f<>:"/\\|?*]', "", title)
+    t = re.sub(r"\s+", " ", t).strip()
+    t = t.strip(". ")
+    return t[:120]
+
+
+def build_filenames(
+    title: str, vid_id: str, start: float | None, duration: float | None
+) -> tuple[str, str]:
+    base = sanitize_title(title)
+    if not base:
+        base = re.sub(r"[^A-Za-z0-9_-]", "_", vid_id)[:64] or "video"
+
     suffix = ""
     if start is not None:
         suffix += f"_t{int(start)}"
     if duration is not None:
         suffix += f"_d{int(duration)}"
-    return f"{vid}{suffix}.mp4"
+
+    utf8_name = f"{base}{suffix}.mp4"
+    ascii_base = re.sub(r"[^A-Za-z0-9 ._-]", "_", base).strip("_ ") or (vid_id or "video")
+    ascii_name = f"{ascii_base}{suffix}.mp4"
+    return ascii_name, utf8_name
 
 
 async def get_stream_url(video_url: str, source: str) -> dict:
@@ -93,6 +98,9 @@ async def get_stream_url(video_url: str, source: str) -> dict:
         raise HTTPException(502, f"yt-dlp: {stderr.decode()[-500:]}")
 
     info = json.loads(stdout)
+    title = info.get("title") or ""
+    vid_id = info.get("id") or ""
+
     if "requested_formats" in info:
         fmts = info["requested_formats"]
         video = next((f for f in fmts if f.get("vcodec") != "none"), None)
@@ -104,11 +112,15 @@ async def get_stream_url(video_url: str, source: str) -> dict:
             "video": video["url"],
             "audio": audio["url"] if audio else None,
             "headers": video.get("http_headers", {}),
+            "title": title,
+            "id": vid_id,
         }
     return {
         "video": info["url"],
         "audio": None,
         "headers": info.get("http_headers", {}),
+        "title": title,
+        "id": vid_id,
     }
 
 
@@ -210,14 +222,21 @@ async def stream_video(
                     await proc.wait()
             await stderr_task
 
-    filename = safe_filename(video_url, start, duration)
+    ascii_name, utf8_name = build_filenames(
+        streams.get("title", ""), streams.get("id", ""), start, duration
+    )
+    disposition = (
+        f'attachment; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(utf8_name)}"
+    )
+
     return StreamingResponse(
         generate(),
         media_type="video/mp4",
         headers={
             "Accept-Ranges": "none",
             "Cache-Control": "no-cache",
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": disposition,
             "X-Content-Type-Options": "nosniff",
         },
     )
