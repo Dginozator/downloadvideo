@@ -1,4 +1,3 @@
-```markdown
 # Video Stream Proxy
 
 FastAPI service that proxies video streams from Rutube and YouTube through ffmpeg, producing a fragmented MP4 stream on the fly. Supports partial downloads via start time and duration parameters.
@@ -134,5 +133,4 @@ Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
-```
 ```
