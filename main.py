@@ -316,18 +316,29 @@ function go(e) {
   const data = Object.fromEntries(fd.entries());
   if (!data.v || !data.auth) return false;
 
-  const qs = buildQuery(data);
+  const qs = buildQuery(data) + "&_=" + Date.now();
   const streamUrl = "/stream?" + qs;
   const downloadUrl = "/download?" + qs;
 
   const out = document.getElementById("out");
-  out.innerHTML = `
-    <video controls autoplay src="\${streamUrl}"></video>
-    <div class="row">
-      <a href="\${downloadUrl}" download>⬇ Скачать MP4</a>
-    </div>
-    <div class="hint">Перемотка в плеере может быть недоступна — стрим фрагментированный.</div>
-  `;
+  out.innerHTML =
+    '<video id="vid" controls autoplay src="' + streamUrl + '"></video>' +
+    '<div class="row">' +
+      '<a href="' + downloadUrl + '" download>Скачать MP4</a> ' +
+      '<a href="' + streamUrl + '" target="_blank">Открыть поток в новой вкладке</a>' +
+    '</div>' +
+    '<div id="verr" class="hint"></div>';
+
+  document.getElementById("vid").addEventListener("error", async () => {
+    try {
+      const r = await fetch(streamUrl);
+      const text = await r.text();
+      document.getElementById("verr").textContent =
+        "Ошибка " + r.status + ": " + text.slice(0, 500);
+    } catch (err) {
+      document.getElementById("verr").textContent = "Fetch failed: " + err;
+    }
+  });
   return false;
 }
 </script>
