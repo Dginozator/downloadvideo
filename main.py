@@ -21,6 +21,119 @@ YT_COOKIES = os.getenv("YT_COOKIES_FILE", "").strip()
 MAX_DURATION = 4 * 60 * 60
 MAX_START = 24 * 60 * 60
 
+GIF_MAX_DURATION = 60
+GIF_DEFAULT_WIDTH = 400
+GIF_DEFAULT_FPS = 12
+
+def build_ffmpeg_gif_cmd(
+    video_url: str,
+    headers: dict,
+    referer: str,
+    start: float | None,
+    duration: float | None,
+    width: int,
+    fps: int,
+) -> list[str]:
+    ua = headers.get("User-Agent", "Mozilla/5.0")
+    cmd = ["ffmpeg", "-loglevel", "warning"]
+    if start is not None:
+        cmd += ["-ss", str(start)]
+    cmd += [
+        "-user_agent", ua,
+        "-referer", referer,
+        "-i", video_url,
+    ]
+    if duration is not None:
+        cmd += ["-t", str(duration)]
+
+    vf = (
+        f"fps={fps},scale={width}:-2:flags=lanczos,"
+        "split[a][b];"
+        "[a]palettegen=max_colors=128[p];"
+        "[b][p]paletteuse=dither=bayer:bayer_scale=5"
+    )
+    cmd += [
+        "-filter_complex", vf,
+        "-f", "gif",
+        "pipe:1",
+    ]
+    return cmd
+
+
+async def stream_gif(
+    video_url: str,
+    source: str,
+    request: Request,
+    start: float | None,
+    duration: float | None,
+    width: int,
+    fps: int,
+):
+    streams = await get_stream_url(video_url, source)
+    cmd = build_ffmpeg_gif_cmd(
+        streams["video"],
+        streams["headers"],
+        referer_for(source),
+        start,
+        duration,
+        width,
+        fps,
+    )
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def log_stderr() -> None:
+        assert proc.stderr is not None
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                break
+            print(f"[ffmpeg-gif] {line.decode(errors='replace').rstrip()}", flush=True)
+
+    stderr_task = asyncio.create_task(log_stderr())
+
+    async def generate():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+            await stderr_task
+
+    ascii_name, utf8_name = build_filenames(
+        streams.get("title", ""), streams.get("id", ""), start, duration
+    )
+    ascii_name = ascii_name.rsplit(".", 1)[0] + ".gif"
+    utf8_name = utf8_name.rsplit(".", 1)[0] + ".gif"
+
+    disposition = (
+        f'attachment; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(utf8_name)}"
+    )
+    return StreamingResponse(
+        generate(),
+        media_type="image/gif",
+        headers={
+            "Cache-Control": "no-cache",
+            "Content-Disposition": disposition,
+        },
+    )
+
 
 def detect_source(url: str) -> str | None:
     try:
@@ -330,15 +443,17 @@ function go(e) {
   const qs = buildQuery(data) + "&_=" + Date.now();
   const streamUrl = "/stream?" + qs;
   const downloadUrl = "/download?" + qs;
+  const gifUrl = "/gif?" + qs;
 
   const out = document.getElementById("out");
   out.innerHTML =
-    '<video id="vid" controls autoplay src="' + streamUrl + '"></video>' +
-    '<div class="row">' +
-      '<a href="' + downloadUrl + '" download>Скачать MP4</a> ' +
-      '<a href="' + streamUrl + '" target="_blank">Открыть поток в новой вкладке</a>' +
-    '</div>' +
-    '<div id="verr" class="hint"></div>';
+  '<video id="vid" controls autoplay src="' + streamUrl + '"></video>' +
+  '<div class="row">' +
+    '<a href="' + downloadUrl + '" download>Скачать MP4</a> ' +
+    '<a href="' + gifUrl + '" download>Скачать GIF</a> ' +
+    '<a href="' + streamUrl + '" target="_blank">Открыть поток</a>' +
+  '</div>' +
+  '<div id="verr" class="hint"></div>';
 
   document.getElementById("vid").addEventListener("error", async () => {
     try {
@@ -385,6 +500,20 @@ async def download(
 ):
     source = validate_request(v, auth)
     return await stream_video(v, source, request, t, duration, as_attachment=True)
+
+
+@app.get("/gif")
+async def gif(
+    request: Request,
+    v: str,
+    auth: str,
+    t: float | None = Query(None, ge=0, le=MAX_START),
+    duration: float | None = Query(None, gt=0, le=GIF_MAX_DURATION),
+    width: int = Query(GIF_DEFAULT_WIDTH, ge=120, le=800),
+    fps: int = Query(GIF_DEFAULT_FPS, ge=5, le=24),
+):
+    source = validate_request(v, auth)
+    return await stream_gif(v, source, request, t, duration, width, fps)
 
 
 @app.get("/health")
