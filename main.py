@@ -5,7 +5,7 @@ import re
 from urllib.parse import urlparse, quote
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 
 app = FastAPI()
 
@@ -176,6 +176,7 @@ async def stream_video(
     request: Request,
     start: float | None,
     duration: float | None,
+    as_attachment: bool,
 ):
     streams = await get_stream_url(video_url, source)
     cmd = build_ffmpeg_cmd(
@@ -225,8 +226,9 @@ async def stream_video(
     ascii_name, utf8_name = build_filenames(
         streams.get("title", ""), streams.get("id", ""), start, duration
     )
+    disposition_type = "attachment" if as_attachment else "inline"
     disposition = (
-        f'attachment; filename="{ascii_name}"; '
+        f'{disposition_type}; filename="{ascii_name}"; '
         f"filename*=UTF-8''{quote(utf8_name)}"
     )
 
@@ -242,6 +244,15 @@ async def stream_video(
     )
 
 
+def validate_request(v: str, auth: str) -> str:
+    source = detect_source(v)
+    if source is None:
+        raise HTTPException(status_code=400, detail="Unsupported URL (rutube/youtube only)")
+    if not verify_token(auth):
+        raise HTTPException(status_code=401, detail="Invalid or missing token")
+    return source
+
+
 @app.get("/")
 async def stream(
     request: Request,
@@ -250,14 +261,123 @@ async def stream(
     t: float | None = Query(None, ge=0, le=MAX_START),
     duration: float | None = Query(None, gt=0, le=MAX_DURATION),
 ):
-    source = detect_source(v)
-    if source is None:
-        raise HTTPException(status_code=400, detail="Unsupported URL (rutube/youtube only)")
-    if not verify_token(auth):
-        raise HTTPException(status_code=401, detail="Invalid or missing token")
-    return await stream_video(v, source, request, t, duration)
+    source = validate_request(v, auth)
+    return await stream_video(v, source, request, t, duration, as_attachment=True)
+
+
+@app.get("/stream")
+async def stream_inline(
+    request: Request,
+    v: str,
+    auth: str,
+    t: float | None = Query(None, ge=0, le=MAX_START),
+    duration: float | None = Query(None, gt=0, le=MAX_DURATION),
+):
+    source = validate_request(v, auth)
+    return await stream_video(v, source, request, t, duration, as_attachment=False)
+
+
+@app.get("/download")
+async def download(
+    request: Request,
+    v: str,
+    auth: str,
+    t: float | None = Query(None, ge=0, le=MAX_START),
+    duration: float | None = Query(None, gt=0, le=MAX_DURATION),
+):
+    source = validate_request(v, auth)
+    return await stream_video(v, source, request, t, duration, as_attachment=True)
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+UI_HTML = """<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video Proxy</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; margin-bottom: 1rem; }
+  form { display: grid; gap: .6rem; grid-template-columns: 1fr 1fr; }
+  form .full { grid-column: 1 / -1; }
+  label { display: block; font-size: .85rem; margin-bottom: .2rem; opacity: .8; }
+  input { width: 100%; padding: .5rem; font-size: .95rem; box-sizing: border-box; }
+  button { padding: .6rem 1.2rem; font-size: 1rem; cursor: pointer; }
+  .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin-top: 1rem; }
+  .row a { word-break: break-all; }
+  video { width: 100%; margin-top: 1rem; background: #000; }
+  .hint { font-size: .8rem; opacity: .7; margin-top: .3rem; }
+  .err { color: #c33; margin-top: 1rem; }
+</style>
+</head>
+<body>
+<h1>Video Proxy</h1>
+<form id="f" onsubmit="return go(event)">
+  <div class="full">
+    <label>URL видео (YouTube / Rutube)</label>
+    <input name="v" required placeholder="https://...">
+  </div>
+  <div class="full">
+    <label>Токен</label>
+    <input name="auth" required type="password">
+  </div>
+  <div>
+    <label>Начало, сек</label>
+    <input name="t" type="number" min="0" step="1" placeholder="0">
+  </div>
+  <div>
+    <label>Длительность, сек</label>
+    <input name="duration" type="number" min="1" step="1" placeholder="до конца">
+  </div>
+  <div class="full">
+    <button type="submit">Показать</button>
+  </div>
+</form>
+
+<div id="out"></div>
+
+<script>
+function buildQuery(data) {
+  const p = new URLSearchParams();
+  p.set("v", data.v);
+  p.set("auth", data.auth);
+  if (data.t) p.set("t", data.t);
+  if (data.duration) p.set("duration", data.duration);
+  return p.toString();
+}
+
+function go(e) {
+  e.preventDefault();
+  const fd = new FormData(document.getElementById("f"));
+  const data = Object.fromEntries(fd.entries());
+  if (!data.v || !data.auth) return false;
+
+  const qs = buildQuery(data);
+  const streamUrl = "/stream?" + qs;
+  const downloadUrl = "/download?" + qs;
+
+  const out = document.getElementById("out");
+  out.innerHTML = `
+    <video controls autoplay src="\${streamUrl}"></video>
+    <div class="row">
+      <a href="\${downloadUrl}" download>⬇ Скачать MP4</a>
+    </div>
+    <div class="hint">Перемотка в плеере может быть недоступна — стрим фрагментированный.</div>
+  `;
+  return false;
+}
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/ui", response_class=HTMLResponse)
+async def ui():
+    return UI_HTML
