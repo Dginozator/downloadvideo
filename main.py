@@ -253,47 +253,6 @@ def validate_request(v: str, auth: str) -> str:
     return source
 
 
-@app.get("/")
-async def stream(
-    request: Request,
-    v: str,
-    auth: str,
-    t: float | None = Query(None, ge=0, le=MAX_START),
-    duration: float | None = Query(None, gt=0, le=MAX_DURATION),
-):
-    source = validate_request(v, auth)
-    return await stream_video(v, source, request, t, duration, as_attachment=True)
-
-
-@app.get("/stream")
-async def stream_inline(
-    request: Request,
-    v: str,
-    auth: str,
-    t: float | None = Query(None, ge=0, le=MAX_START),
-    duration: float | None = Query(None, gt=0, le=MAX_DURATION),
-):
-    source = validate_request(v, auth)
-    return await stream_video(v, source, request, t, duration, as_attachment=False)
-
-
-@app.get("/download")
-async def download(
-    request: Request,
-    v: str,
-    auth: str,
-    t: float | None = Query(None, ge=0, le=MAX_START),
-    duration: float | None = Query(None, gt=0, le=MAX_DURATION),
-):
-    source = validate_request(v, auth)
-    return await stream_video(v, source, request, t, duration, as_attachment=True)
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
 UI_HTML = """<!doctype html>
 <html lang="ru">
 <head>
@@ -313,7 +272,6 @@ UI_HTML = """<!doctype html>
   .row a { word-break: break-all; }
   video { width: 100%; margin-top: 1rem; background: #000; }
   .hint { font-size: .8rem; opacity: .7; margin-top: .3rem; }
-  .err { color: #c33; margin-top: 1rem; }
 </style>
 </head>
 <body>
@@ -378,6 +336,35 @@ function go(e) {
 """
 
 
-@app.get("/ui", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
 async def ui():
     return UI_HTML
+
+
+@app.get("/stream")
+async def stream_inline(
+    request: Request,
+    v: str,
+    auth: str,
+    t: float | None = Query(None, ge=0, le=MAX_START),
+    duration: float | None = Query(None, gt=0, le=MAX_DURATION),
+):
+    source = validate_request(v, auth)
+    return await stream_video(v, source, request, t, duration, as_attachment=False)
+
+
+@app.get("/download")
+async def download(
+    request: Request,
+    v: str,
+    auth: str,
+    t: float | None = Query(None, ge=0, le=MAX_START),
+    duration: float | None = Query(None, gt=0, le=MAX_DURATION),
+):
+    source = validate_request(v, auth)
+    return await stream_video(v, source, request, t, duration, as_attachment=True)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
