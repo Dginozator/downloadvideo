@@ -301,6 +301,15 @@ UI_HTML = """<!doctype html>
 <div id="out"></div>
 
 <script>
+const TOKEN_KEY = "vd_token";
+
+window.addEventListener("DOMContentLoaded", () => {
+  const saved = localStorage.getItem(TOKEN_KEY);
+  if (saved) {
+    document.querySelector('input[name="auth"]').value = saved;
+  }
+});
+
 function buildQuery(data) {
   const p = new URLSearchParams();
   p.set("v", data.v);
@@ -315,6 +324,8 @@ function go(e) {
   const fd = new FormData(document.getElementById("f"));
   const data = Object.fromEntries(fd.entries());
   if (!data.v || !data.auth) return false;
+
+  localStorage.setItem(TOKEN_KEY, data.auth);
 
   const qs = buildQuery(data) + "&_=" + Date.now();
   const streamUrl = "/stream?" + qs;
